@@ -1,6 +1,7 @@
 /**
- * Lakebook to Markdown Converter - Cloudflare Workers Version
- * 将语雀 .lakebook 文件转换为 Markdown 格式
+ * Yuque to Markdown Converter - Cloudflare Workers Version
+ * 将语雀文档转换为 Markdown 格式
+ * 支持：1. 上传 .lakebook 文件  2. 输入语雀公开文档 URL
  */
 
 import JSZip from 'jszip';
@@ -30,6 +31,21 @@ interface DocFile {
   };
 }
 
+interface YuqueDocData {
+  title: string;
+  body_html: string;
+}
+
+interface YuqueTocItem {
+  title: string;
+  slug: string;
+  url: string;
+  level: number;
+  type: string;
+  child_uuid?: string;
+  parent_uuid?: string;
+}
+
 const TYPE_DOC = 'DOC';
 const META_JSON = '$meta.json';
 
@@ -38,6 +54,7 @@ const contentTypeToExtension: Record<string, string> = {
   'image/jpeg': '.jpg',
   'image/svg+xml': '.svg',
   'image/png': '.png',
+  'image/webp': '.webp',
 };
 
 function sanitizeFileName(name: string): string {
@@ -57,14 +74,12 @@ function sanitizeFileName(name: string): string {
 function prettyMd(text: string): string {
   let output = text;
 
-  // 去除每行末尾空格
   const lines = output.split('\n');
   for (let i = 0; i < lines.length; i++) {
     lines[i] = lines[i].trimEnd();
   }
   output = lines.join('\n');
 
-  // 合并多余空行
   for (let i = 0; i < 50; i++) {
     output = output.replace(/\n\n\n/g, '\n\n');
     if (!output.includes('\n\n\n')) {
@@ -75,30 +90,241 @@ function prettyMd(text: string): string {
   return output;
 }
 
+// ============ 语雀 URL 解析和抓取 ============
+
+interface YuqueUrlInfo {
+  namespace: string;
+  book: string;
+  slug?: string;
+  isBook: boolean;
+}
+
+function parseYuqueUrl(url: string): YuqueUrlInfo | null {
+  // 支持的格式:
+  // https://www.yuque.com/namespace/book
+  // https://www.yuque.com/namespace/book/slug
+  // https://yuque.com/namespace/book/slug
+  const match = url.match(/^https?:\/\/(?:www\.)?yuque\.com\/([^\/]+)\/([^\/]+)(?:\/([^\/\?#]+))?/);
+  if (!match) return null;
+
+  return {
+    namespace: match[1],
+    book: match[2],
+    slug: match[3],
+    isBook: !match[3],
+  };
+}
+
+async function fetchYuqueDoc(namespace: string, book: string, slug: string): Promise<YuqueDocData> {
+  // 直接抓取语雀页面
+  const url = `https://www.yuque.com/${namespace}/${book}/${slug}`;
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch document: ${response.status}`);
+  }
+
+  const html = await response.text();
+
+  // 提取标题
+  const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+  let title = titleMatch ? titleMatch[1].replace(/ · 语雀$/, '').trim() : slug;
+
+  // 提取文档内容 - 语雀的文档内容在 script 标签中的 JSON 数据里
+  // 尝试从 window.__INITIAL_STATE__ 中提取
+  const stateMatch = html.match(/window\.__INITIAL_STATE__\s*=\s*({[\s\S]*?});?\s*<\/script>/);
+  if (stateMatch) {
+    try {
+      const state = JSON.parse(stateMatch[1]);
+      const doc = state?.doc?.data || state?.data?.book?.toc?.[0];
+      if (doc) {
+        return {
+          title: doc.title || title,
+          body_html: doc.body_html || doc.body || '',
+        };
+      }
+    } catch (e) {
+      console.error('Failed to parse initial state:', e);
+    }
+  }
+
+  // 备用方案：提取 article 内容
+  const articleMatch = html.match(/<article[^>]*class="[^"]*yuque-doc-content[^"]*"[^>]*>([\s\S]*?)<\/article>/i);
+  if (articleMatch) {
+    return {
+      title,
+      body_html: articleMatch[1],
+    };
+  }
+
+  // 再次备用：尝试提取 ne-viewer-body
+  const viewerMatch = html.match(/<div[^>]*class="[^"]*ne-viewer-body[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>\s*<\/div>/i);
+  if (viewerMatch) {
+    return {
+      title,
+      body_html: viewerMatch[1],
+    };
+  }
+
+  throw new Error('Cannot extract document content from page');
+}
+
+async function fetchYuqueBookToc(namespace: string, book: string): Promise<YuqueTocItem[]> {
+  // 获取知识库目录
+  const url = `https://www.yuque.com/${namespace}/${book}`;
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch book: ${response.status}`);
+  }
+
+  const html = await response.text();
+
+  // 从 __INITIAL_STATE__ 中提取目录
+  const stateMatch = html.match(/window\.__INITIAL_STATE__\s*=\s*({[\s\S]*?});?\s*<\/script>/);
+  if (stateMatch) {
+    try {
+      const state = JSON.parse(stateMatch[1]);
+      const toc = state?.book?.toc || state?.data?.book?.toc || [];
+      return toc.map((item: any) => ({
+        title: item.title || '',
+        slug: item.slug || item.url || '',
+        url: item.url || item.slug || '',
+        level: item.depth || item.level || 0,
+        type: item.type === 'TITLE' ? 'TITLE' : 'DOC',
+      }));
+    } catch (e) {
+      console.error('Failed to parse initial state:', e);
+    }
+  }
+
+  throw new Error('Cannot extract TOC from book page');
+}
+
+async function convertYuqueUrlToMarkdown(
+  yuqueUrl: string,
+  downloadImages: boolean
+): Promise<JSZip> {
+  const urlInfo = parseYuqueUrl(yuqueUrl);
+  if (!urlInfo) {
+    throw new Error('Invalid Yuque URL format');
+  }
+
+  const zip = new JSZip();
+
+  if (urlInfo.isBook) {
+    // 整个知识库
+    const toc = await fetchYuqueBookToc(urlInfo.namespace, urlInfo.book);
+    console.log(`Found ${toc.length} items in book`);
+
+    let pathPrefixed: string[] = [];
+    let lastLevel = 0;
+    let lastSanitizedTitle = '';
+    const usedNames = new Set<string>();
+
+    for (const item of toc) {
+      if (!item.title) continue;
+
+      let sanitizedTitle = sanitizeFileName(item.title);
+      while (usedNames.has(sanitizedTitle)) {
+        sanitizedTitle = sanitizeFileName(item.title) + String(Math.floor(Math.random() * 1000));
+      }
+      usedNames.add(sanitizedTitle);
+
+      const currentLevel = item.level;
+
+      if (currentLevel > lastLevel) {
+        pathPrefixed = [...pathPrefixed, lastSanitizedTitle];
+      } else if (currentLevel < lastLevel) {
+        const diff = lastLevel - currentLevel;
+        pathPrefixed = pathPrefixed.slice(0, -diff);
+      }
+
+      if (item.type === 'DOC' && item.slug) {
+        try {
+          const doc = await fetchYuqueDoc(urlInfo.namespace, urlInfo.book, item.slug);
+          let html = doc.body_html;
+
+          const attachmentsMap = new Map<string, { data: Uint8Array; ext: string }>();
+          const outputDirPath = pathPrefixed.join('/');
+
+          if (downloadImages && html) {
+            html = await downloadImageAndPatchHtml(html, sanitizedTitle, attachmentsMap);
+
+            for (const [attachPath, { data }] of attachmentsMap) {
+              const fullPath = outputDirPath
+                ? `${outputDirPath}/${attachPath}`
+                : attachPath;
+              zip.file(fullPath, data);
+            }
+          }
+
+          const markdown = prettyMd(htmlToMarkdown(html));
+          const outputPath = outputDirPath
+            ? `${outputDirPath}/${sanitizedTitle}.md`
+            : `${sanitizedTitle}.md`;
+          zip.file(outputPath, markdown);
+        } catch (e) {
+          console.error(`Failed to fetch doc ${item.slug}:`, e);
+        }
+      }
+
+      lastSanitizedTitle = sanitizedTitle;
+      lastLevel = currentLevel;
+    }
+  } else {
+    // 单篇文档
+    const doc = await fetchYuqueDoc(urlInfo.namespace, urlInfo.book, urlInfo.slug!);
+    let html = doc.body_html;
+    const sanitizedTitle = sanitizeFileName(doc.title);
+
+    const attachmentsMap = new Map<string, { data: Uint8Array; ext: string }>();
+
+    if (downloadImages && html) {
+      html = await downloadImageAndPatchHtml(html, sanitizedTitle, attachmentsMap);
+
+      for (const [attachPath, { data }] of attachmentsMap) {
+        zip.file(attachPath, data);
+      }
+    }
+
+    const markdown = prettyMd(htmlToMarkdown(html));
+    zip.file(`${sanitizedTitle}.md`, markdown);
+  }
+
+  return zip;
+}
+
+// ============ Lakebook 文件处理 ============
+
 async function extractTarGz(data: ArrayBuffer): Promise<Map<string, Uint8Array>> {
   const files = new Map<string, Uint8Array>();
 
-  // 解压 gzip
   const tarData = ungzip(new Uint8Array(data));
 
-  // 解析 tar 格式
   let offset = 0;
   while (offset < tarData.length) {
-    // 读取 tar header (512 bytes)
     if (offset + 512 > tarData.length) break;
 
     const header = tarData.slice(offset, offset + 512);
 
-    // 检查是否为空 header（文件结束）
     if (header.every(b => b === 0)) break;
 
-    // 提取文件名 (前 100 bytes)
     let fileName = '';
     for (let i = 0; i < 100 && header[i] !== 0; i++) {
       fileName += String.fromCharCode(header[i]);
     }
 
-    // 检查 ustar 格式的前缀 (offset 345, 155 bytes)
     let prefix = '';
     for (let i = 345; i < 500 && header[i] !== 0; i++) {
       prefix += String.fromCharCode(header[i]);
@@ -107,25 +333,21 @@ async function extractTarGz(data: ArrayBuffer): Promise<Map<string, Uint8Array>>
       fileName = prefix + '/' + fileName;
     }
 
-    // 提取文件大小 (offset 124, 12 bytes, octal)
     let sizeStr = '';
     for (let i = 124; i < 136 && header[i] !== 0 && header[i] !== 32; i++) {
       sizeStr += String.fromCharCode(header[i]);
     }
     const fileSize = parseInt(sizeStr, 8) || 0;
 
-    // 提取文件类型 (offset 156, 1 byte)
     const typeFlag = String.fromCharCode(header[156]);
 
     offset += 512;
 
-    // 只处理普通文件
     if (typeFlag === '0' || typeFlag === '\0') {
       const fileData = tarData.slice(offset, offset + fileSize);
       files.set(fileName, fileData);
     }
 
-    // 跳过文件数据（按 512 字节对齐）
     offset += Math.ceil(fileSize / 512) * 512;
   }
 
@@ -162,21 +384,26 @@ async function downloadImageAndPatchHtml(
   attachmentsMap: Map<string, { data: Uint8Array; ext: string }>
 ): Promise<string> {
   const imgRegex = /<img[^>]+src="([^"]+)"[^>]*>/gi;
-  let match;
   let no = 1;
   let modifiedHtml = html;
 
   const matches: { original: string; src: string }[] = [];
+  let match;
   while ((match = imgRegex.exec(html)) !== null) {
     matches.push({ original: match[0], src: match[1] });
   }
 
   for (const { original, src } of matches) {
     try {
-      const response = await fetch(src);
+      const response = await fetch(src, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer': 'https://www.yuque.com/',
+        },
+      });
       if (response.ok) {
         const contentType = response.headers.get('Content-Type') || '';
-        const ext = contentTypeToExtension[contentType] || '.png';
+        const ext = contentTypeToExtension[contentType.split(';')[0]] || '.png';
         const data = new Uint8Array(await response.arrayBuffer());
         const fileName = `${sanitizedTitle}_${String(no).padStart(3, '0')}${ext}`;
 
@@ -243,7 +470,6 @@ async function extractRepos(
         if (downloadImage && html) {
           html = await downloadImageAndPatchHtml(html, sanitizedTitle, attachmentsMap);
 
-          // 添加附件到 zip
           for (const [attachPath, { data }] of attachmentsMap) {
             const fullPath = outputDirPath
               ? `${outputDirPath}/${attachPath}`
@@ -267,9 +493,10 @@ async function extractRepos(
   return zip;
 }
 
+// ============ Worker 入口 ============
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    // 处理 CORS
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
@@ -280,69 +507,56 @@ export default {
       });
     }
 
-    // 首页 - 显示上传表单
     if (request.method === 'GET') {
       return new Response(getUploadHtml(), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
     }
 
-    // 处理上传
     if (request.method === 'POST') {
       try {
         const formData = await request.formData();
         const file = formData.get('lakebook') as File | null;
-        const lakebookUrl = formData.get('lakebookUrl') as string | null;
+        const yuqueUrl = formData.get('yuqueUrl') as string | null;
         const downloadImages = formData.get('downloadImages') === 'true';
 
-        let arrayBuffer: ArrayBuffer;
+        let zip: JSZip;
 
-        if (lakebookUrl && lakebookUrl.trim()) {
-          // 从 URL 获取文件
-          try {
-            const response = await fetch(lakebookUrl.trim());
-            if (!response.ok) {
-              return new Response(JSON.stringify({ error: `Failed to fetch URL: ${response.status} ${response.statusText}` }), {
-                status: 400,
-                headers: { 'Content-Type': 'application/json' },
-              });
-            }
-            arrayBuffer = await response.arrayBuffer();
-          } catch (fetchError) {
-            return new Response(JSON.stringify({ error: `Failed to fetch URL: ${String(fetchError)}` }), {
+        if (yuqueUrl && yuqueUrl.trim()) {
+          // 从语雀 URL 抓取
+          const urlInfo = parseYuqueUrl(yuqueUrl.trim());
+          if (!urlInfo) {
+            return new Response(JSON.stringify({ error: '无效的语雀 URL，请输入类似 https://www.yuque.com/xxx/yyy 的链接' }), {
               status: 400,
               headers: { 'Content-Type': 'application/json' },
             });
           }
+
+          zip = await convertYuqueUrlToMarkdown(yuqueUrl.trim(), downloadImages);
         } else if (file && file.size > 0) {
-          arrayBuffer = await file.arrayBuffer();
+          // 处理上传的 lakebook 文件
+          const arrayBuffer = await file.arrayBuffer();
+          const files = await extractTarGz(arrayBuffer);
+
+          const repoDir = findRepoDir(files);
+          if (!repoDir) {
+            return new Response(JSON.stringify({ error: '无效的 .lakebook 文件' }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          const toc = readToc(files, repoDir);
+          console.log(`Total ${toc.length} files`);
+
+          zip = await extractRepos(files, repoDir, toc, downloadImages);
         } else {
-          return new Response(JSON.stringify({ error: 'No file uploaded or URL provided' }), {
+          return new Response(JSON.stringify({ error: '请上传文件或输入语雀 URL' }), {
             status: 400,
             headers: { 'Content-Type': 'application/json' },
           });
         }
 
-        // 解压 tar.gz
-        const files = await extractTarGz(arrayBuffer);
-
-        // 找到 repo 目录
-        const repoDir = findRepoDir(files);
-        if (!repoDir) {
-          return new Response(JSON.stringify({ error: 'Invalid .lakebook file' }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-
-        // 读取目录结构
-        const toc = readToc(files, repoDir);
-        console.log(`Total ${toc.length} files`);
-
-        // 转换并生成 zip
-        const zip = await extractRepos(files, repoDir, toc, downloadImages);
-
-        // 生成 zip 文件
         const zipBlob = await zip.generateAsync({ type: 'arraybuffer' });
 
         return new Response(zipBlob, {
@@ -353,9 +567,9 @@ export default {
           },
         });
       } catch (error) {
-        console.error('Error processing file:', error);
+        console.error('Error processing:', error);
         return new Response(
-          JSON.stringify({ error: 'Failed to process file', details: String(error) }),
+          JSON.stringify({ error: '处理失败', details: String(error) }),
           {
             status: 500,
             headers: { 'Content-Type': 'application/json' },
@@ -374,7 +588,7 @@ function getUploadHtml(): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Lakebook to Markdown Converter</title>
+  <title>语雀文档转 Markdown</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -390,7 +604,7 @@ function getUploadHtml(): string {
       background: white;
       border-radius: 16px;
       padding: 40px;
-      max-width: 500px;
+      max-width: 520px;
       width: 100%;
       box-shadow: 0 20px 60px rgba(0,0,0,0.3);
     }
@@ -485,6 +699,13 @@ function getUploadHtml(): string {
       color: #999;
       font-size: 12px;
       margin-top: 8px;
+      line-height: 1.6;
+    }
+    .url-input-area .hint code {
+      background: #f0f0f0;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 11px;
     }
     .options {
       margin-bottom: 20px;
@@ -555,35 +776,39 @@ function getUploadHtml(): string {
       background: #ffeaea;
       border-radius: 8px;
       display: none;
+      font-size: 14px;
     }
     .error.show { display: block; }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>Lakebook to Markdown</h1>
-    <p class="subtitle">将语雀 .lakebook 文件转换为 Markdown 格式</p>
+    <h1>语雀文档转 Markdown</h1>
+    <p class="subtitle">支持公开文档 URL 或 .lakebook 文件</p>
 
     <form id="uploadForm" enctype="multipart/form-data">
       <div class="tabs">
-        <button type="button" class="tab active" data-tab="file">上传文件</button>
-        <button type="button" class="tab" data-tab="url">填写 URL</button>
+        <button type="button" class="tab active" data-tab="url">输入 URL</button>
+        <button type="button" class="tab" data-tab="file">上传文件</button>
       </div>
 
-      <div id="fileTab" class="tab-content active">
+      <div id="urlTab" class="tab-content active">
+        <div class="url-input-area">
+          <label for="urlInput">语雀文档 URL</label>
+          <input type="text" id="urlInput" name="yuqueUrl" placeholder="https://www.yuque.com/xxx/yyy/zzz">
+          <p class="hint">
+            支持单篇文档: <code>yuque.com/用户/知识库/文档</code><br>
+            支持整个知识库: <code>yuque.com/用户/知识库</code>
+          </p>
+        </div>
+      </div>
+
+      <div id="fileTab" class="tab-content">
         <div class="upload-area" id="uploadArea">
           <input type="file" name="lakebook" id="fileInput" accept=".lakebook">
           <div class="upload-icon">📄</div>
           <div class="upload-text">点击或拖拽 .lakebook 文件到此处</div>
           <div class="file-name" id="fileName"></div>
-        </div>
-      </div>
-
-      <div id="urlTab" class="tab-content">
-        <div class="url-input-area">
-          <label for="urlInput">Lakebook 文件 URL</label>
-          <input type="text" id="urlInput" name="lakebookUrl" placeholder="https://example.com/file.lakebook">
-          <p class="hint">输入 .lakebook 文件的直接下载链接</p>
         </div>
       </div>
 
@@ -599,7 +824,7 @@ function getUploadHtml(): string {
 
     <div class="progress" id="progress">
       <span class="spinner"></span>
-      <span>正在处理中，请稍候...</span>
+      <span id="progressText">正在处理中，请稍候...</span>
     </div>
 
     <div class="error" id="error"></div>
@@ -613,13 +838,13 @@ function getUploadHtml(): string {
     const submitBtn = document.getElementById('submitBtn');
     const uploadForm = document.getElementById('uploadForm');
     const progress = document.getElementById('progress');
+    const progressText = document.getElementById('progressText');
     const error = document.getElementById('error');
     const tabs = document.querySelectorAll('.tab');
     const tabContents = document.querySelectorAll('.tab-content');
 
-    let currentTab = 'file';
+    let currentTab = 'url';
 
-    // Tab 切换
     tabs.forEach(tab => {
       tab.addEventListener('click', () => {
         const tabName = tab.dataset.tab;
@@ -674,10 +899,10 @@ function getUploadHtml(): string {
     }
 
     function updateSubmitButton() {
-      if (currentTab === 'file') {
-        submitBtn.disabled = !fileInput.files || fileInput.files.length === 0;
-      } else {
+      if (currentTab === 'url') {
         submitBtn.disabled = !urlInput.value.trim();
+      } else {
+        submitBtn.disabled = !fileInput.files || fileInput.files.length === 0;
       }
     }
 
@@ -686,15 +911,17 @@ function getUploadHtml(): string {
 
       error.classList.remove('show');
       progress.classList.add('show');
+      progressText.textContent = currentTab === 'url'
+        ? '正在抓取语雀文档...'
+        : '正在处理文件...';
       submitBtn.disabled = true;
 
       const formData = new FormData(uploadForm);
 
-      // 如果是文件模式，清除 URL；如果是 URL 模式，清除文件
-      if (currentTab === 'file') {
-        formData.delete('lakebookUrl');
-      } else {
+      if (currentTab === 'url') {
         formData.delete('lakebook');
+      } else {
+        formData.delete('yuqueUrl');
       }
 
       try {
@@ -705,7 +932,7 @@ function getUploadHtml(): string {
 
         if (!response.ok) {
           const result = await response.json();
-          throw new Error(result.error || 'Unknown error');
+          throw new Error(result.error || result.details || 'Unknown error');
         }
 
         const blob = await response.blob();
@@ -718,13 +945,16 @@ function getUploadHtml(): string {
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
       } catch (err) {
-        error.textContent = '错误: ' + err.message;
+        error.textContent = err.message;
         error.classList.add('show');
       } finally {
         progress.classList.remove('show');
         updateSubmitButton();
       }
     });
+
+    // 初始化
+    updateSubmitButton();
   </script>
 </body>
 </html>`;
