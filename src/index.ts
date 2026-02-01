@@ -292,16 +292,36 @@ export default {
       try {
         const formData = await request.formData();
         const file = formData.get('lakebook') as File | null;
+        const lakebookUrl = formData.get('lakebookUrl') as string | null;
         const downloadImages = formData.get('downloadImages') === 'true';
 
-        if (!file) {
-          return new Response(JSON.stringify({ error: 'No file uploaded' }), {
+        let arrayBuffer: ArrayBuffer;
+
+        if (lakebookUrl && lakebookUrl.trim()) {
+          // 从 URL 获取文件
+          try {
+            const response = await fetch(lakebookUrl.trim());
+            if (!response.ok) {
+              return new Response(JSON.stringify({ error: `Failed to fetch URL: ${response.status} ${response.statusText}` }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' },
+              });
+            }
+            arrayBuffer = await response.arrayBuffer();
+          } catch (fetchError) {
+            return new Response(JSON.stringify({ error: `Failed to fetch URL: ${String(fetchError)}` }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+        } else if (file && file.size > 0) {
+          arrayBuffer = await file.arrayBuffer();
+        } else {
+          return new Response(JSON.stringify({ error: 'No file uploaded or URL provided' }), {
             status: 400,
             headers: { 'Content-Type': 'application/json' },
           });
         }
-
-        const arrayBuffer = await file.arrayBuffer();
 
         // 解压 tar.gz
         const files = await extractTarGz(arrayBuffer);
@@ -384,6 +404,32 @@ function getUploadHtml(): string {
       margin-bottom: 30px;
       font-size: 14px;
     }
+    .tabs {
+      display: flex;
+      margin-bottom: 20px;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid #ddd;
+    }
+    .tab {
+      flex: 1;
+      padding: 12px;
+      text-align: center;
+      cursor: pointer;
+      background: #f5f5f5;
+      color: #666;
+      font-size: 14px;
+      font-weight: 500;
+      transition: all 0.3s ease;
+      border: none;
+    }
+    .tab:first-child { border-right: 1px solid #ddd; }
+    .tab.active {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+    }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
     .upload-area {
       border: 2px dashed #ddd;
       border-radius: 12px;
@@ -397,7 +443,7 @@ function getUploadHtml(): string {
       border-color: #667eea;
       background: #f8f9ff;
     }
-    .upload-area input {
+    .upload-area input[type="file"] {
       display: none;
     }
     .upload-icon {
@@ -412,6 +458,33 @@ function getUploadHtml(): string {
       margin-top: 10px;
       color: #667eea;
       font-weight: 500;
+    }
+    .url-input-area {
+      margin-bottom: 20px;
+    }
+    .url-input-area label {
+      display: block;
+      color: #333;
+      font-size: 14px;
+      margin-bottom: 8px;
+      font-weight: 500;
+    }
+    .url-input-area input[type="text"] {
+      width: 100%;
+      padding: 14px;
+      border: 2px solid #ddd;
+      border-radius: 8px;
+      font-size: 14px;
+      transition: border-color 0.3s ease;
+    }
+    .url-input-area input[type="text"]:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+    .url-input-area .hint {
+      color: #999;
+      font-size: 12px;
+      margin-top: 8px;
     }
     .options {
       margin-bottom: 20px;
@@ -432,7 +505,7 @@ function getUploadHtml(): string {
       color: #333;
       font-size: 14px;
     }
-    button {
+    button[type="submit"] {
       width: 100%;
       padding: 14px;
       background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -444,11 +517,11 @@ function getUploadHtml(): string {
       cursor: pointer;
       transition: transform 0.2s ease, box-shadow 0.2s ease;
     }
-    button:hover {
+    button[type="submit"]:hover {
       transform: translateY(-2px);
       box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
     }
-    button:disabled {
+    button[type="submit"]:disabled {
       opacity: 0.6;
       cursor: not-allowed;
       transform: none;
@@ -488,15 +561,30 @@ function getUploadHtml(): string {
 </head>
 <body>
   <div class="container">
-    <h1>📚 Lakebook to Markdown</h1>
+    <h1>Lakebook to Markdown</h1>
     <p class="subtitle">将语雀 .lakebook 文件转换为 Markdown 格式</p>
 
     <form id="uploadForm" enctype="multipart/form-data">
-      <div class="upload-area" id="uploadArea">
-        <input type="file" name="lakebook" id="fileInput" accept=".lakebook">
-        <div class="upload-icon">📄</div>
-        <div class="upload-text">点击或拖拽 .lakebook 文件到此处</div>
-        <div class="file-name" id="fileName"></div>
+      <div class="tabs">
+        <button type="button" class="tab active" data-tab="file">上传文件</button>
+        <button type="button" class="tab" data-tab="url">填写 URL</button>
+      </div>
+
+      <div id="fileTab" class="tab-content active">
+        <div class="upload-area" id="uploadArea">
+          <input type="file" name="lakebook" id="fileInput" accept=".lakebook">
+          <div class="upload-icon">📄</div>
+          <div class="upload-text">点击或拖拽 .lakebook 文件到此处</div>
+          <div class="file-name" id="fileName"></div>
+        </div>
+      </div>
+
+      <div id="urlTab" class="tab-content">
+        <div class="url-input-area">
+          <label for="urlInput">Lakebook 文件 URL</label>
+          <input type="text" id="urlInput" name="lakebookUrl" placeholder="https://example.com/file.lakebook">
+          <p class="hint">输入 .lakebook 文件的直接下载链接</p>
+        </div>
       </div>
 
       <div class="options">
@@ -521,10 +609,35 @@ function getUploadHtml(): string {
     const uploadArea = document.getElementById('uploadArea');
     const fileInput = document.getElementById('fileInput');
     const fileName = document.getElementById('fileName');
+    const urlInput = document.getElementById('urlInput');
     const submitBtn = document.getElementById('submitBtn');
     const uploadForm = document.getElementById('uploadForm');
     const progress = document.getElementById('progress');
     const error = document.getElementById('error');
+    const tabs = document.querySelectorAll('.tab');
+    const tabContents = document.querySelectorAll('.tab-content');
+
+    let currentTab = 'file';
+
+    // Tab 切换
+    tabs.forEach(tab => {
+      tab.addEventListener('click', () => {
+        const tabName = tab.dataset.tab;
+        currentTab = tabName;
+
+        tabs.forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+
+        tabContents.forEach(content => {
+          content.classList.remove('active');
+          if (content.id === tabName + 'Tab') {
+            content.classList.add('active');
+          }
+        });
+
+        updateSubmitButton();
+      });
+    });
 
     uploadArea.addEventListener('click', () => fileInput.click());
 
@@ -543,19 +656,29 @@ function getUploadHtml(): string {
       const files = e.dataTransfer.files;
       if (files.length > 0) {
         fileInput.files = files;
-        updateFileName(files[0]);
+        updateFileDisplay(files[0]);
       }
     });
 
     fileInput.addEventListener('change', () => {
       if (fileInput.files.length > 0) {
-        updateFileName(fileInput.files[0]);
+        updateFileDisplay(fileInput.files[0]);
       }
     });
 
-    function updateFileName(file) {
+    urlInput.addEventListener('input', updateSubmitButton);
+
+    function updateFileDisplay(file) {
       fileName.textContent = file.name;
-      submitBtn.disabled = false;
+      updateSubmitButton();
+    }
+
+    function updateSubmitButton() {
+      if (currentTab === 'file') {
+        submitBtn.disabled = !fileInput.files || fileInput.files.length === 0;
+      } else {
+        submitBtn.disabled = !urlInput.value.trim();
+      }
     }
 
     uploadForm.addEventListener('submit', async (e) => {
@@ -566,6 +689,13 @@ function getUploadHtml(): string {
       submitBtn.disabled = true;
 
       const formData = new FormData(uploadForm);
+
+      // 如果是文件模式，清除 URL；如果是 URL 模式，清除文件
+      if (currentTab === 'file') {
+        formData.delete('lakebookUrl');
+      } else {
+        formData.delete('lakebook');
+      }
 
       try {
         const response = await fetch('/', {
@@ -592,7 +722,7 @@ function getUploadHtml(): string {
         error.classList.add('show');
       } finally {
         progress.classList.remove('show');
-        submitBtn.disabled = false;
+        updateSubmitButton();
       }
     });
   </script>
