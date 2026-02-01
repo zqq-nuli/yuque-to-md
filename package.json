@@ -1,0 +1,25 @@
+{
+  "name": "lakebook-worker",
+  "version": "1.0.0",
+  "description": "Convert Yuque lakebook to markdown - Cloudflare Workers version",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "pako": "^2.1.0",
+    "js-yaml": "^4.1.0",
+    "turndown": "^7.1.2",
+    "jszip": "^3.10.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240117.0",
+    "@types/js-yaml": "^4.0.9",
+    "@types/pako": "^2.0.3",
+    "typescript": "^5.3.3",
+    "wrangler": "^3.24.0",
+    "vitest": "^1.2.2"
+  }
+}
