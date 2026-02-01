@@ -31,19 +31,21 @@ interface DocFile {
   };
 }
 
-interface YuqueDocData {
-  title: string;
-  body_html: string;
-}
-
 interface YuqueTocItem {
+  type: string;
   title: string;
-  slug: string;
   url: string;
   level: number;
-  type: string;
-  child_uuid?: string;
-  parent_uuid?: string;
+  doc_id?: number;
+}
+
+interface YuqueAppData {
+  book?: {
+    id: number;
+    slug: string;
+    name: string;
+    toc: YuqueTocItem[];
+  };
 }
 
 const TYPE_DOC = 'DOC';
@@ -100,10 +102,6 @@ interface YuqueUrlInfo {
 }
 
 function parseYuqueUrl(url: string): YuqueUrlInfo | null {
-  // 支持的格式:
-  // https://www.yuque.com/namespace/book
-  // https://www.yuque.com/namespace/book/slug
-  // https://yuque.com/namespace/book/slug
   const match = url.match(/^https?:\/\/(?:www\.)?yuque\.com\/([^\/]+)\/([^\/]+)(?:\/([^\/\?#]+))?/);
   if (!match) return null;
 
@@ -115,67 +113,23 @@ function parseYuqueUrl(url: string): YuqueUrlInfo | null {
   };
 }
 
-async function fetchYuqueDoc(namespace: string, book: string, slug: string): Promise<YuqueDocData> {
-  // 直接抓取语雀页面
-  const url = `https://www.yuque.com/${namespace}/${book}/${slug}`;
-  const response = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    },
-  });
+// 从页面 HTML 中提取 appData
+function extractAppData(html: string): YuqueAppData | null {
+  // 查找 window.appData = JSON.parse(decodeURIComponent("..."))
+  const match = html.match(/window\.appData\s*=\s*JSON\.parse\(decodeURIComponent\("([^"]+)"\)\)/);
+  if (!match) return null;
 
-  if (!response.ok) {
-    throw new Error(`Failed to fetch document: ${response.status}`);
+  try {
+    const decoded = decodeURIComponent(match[1]);
+    return JSON.parse(decoded);
+  } catch (e) {
+    console.error('Failed to parse appData:', e);
+    return null;
   }
-
-  const html = await response.text();
-
-  // 提取标题
-  const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
-  let title = titleMatch ? titleMatch[1].replace(/ · 语雀$/, '').trim() : slug;
-
-  // 提取文档内容 - 语雀的文档内容在 script 标签中的 JSON 数据里
-  // 尝试从 window.__INITIAL_STATE__ 中提取
-  const stateMatch = html.match(/window\.__INITIAL_STATE__\s*=\s*({[\s\S]*?});?\s*<\/script>/);
-  if (stateMatch) {
-    try {
-      const state = JSON.parse(stateMatch[1]);
-      const doc = state?.doc?.data || state?.data?.book?.toc?.[0];
-      if (doc) {
-        return {
-          title: doc.title || title,
-          body_html: doc.body_html || doc.body || '',
-        };
-      }
-    } catch (e) {
-      console.error('Failed to parse initial state:', e);
-    }
-  }
-
-  // 备用方案：提取 article 内容
-  const articleMatch = html.match(/<article[^>]*class="[^"]*yuque-doc-content[^"]*"[^>]*>([\s\S]*?)<\/article>/i);
-  if (articleMatch) {
-    return {
-      title,
-      body_html: articleMatch[1],
-    };
-  }
-
-  // 再次备用：尝试提取 ne-viewer-body
-  const viewerMatch = html.match(/<div[^>]*class="[^"]*ne-viewer-body[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>\s*<\/div>/i);
-  if (viewerMatch) {
-    return {
-      title,
-      body_html: viewerMatch[1],
-    };
-  }
-
-  throw new Error('Cannot extract document content from page');
 }
 
-async function fetchYuqueBookToc(namespace: string, book: string): Promise<YuqueTocItem[]> {
-  // 获取知识库目录
+// 获取知识库页面并提取数据
+async function fetchYuqueBookData(namespace: string, book: string): Promise<{ bookId: number; toc: YuqueTocItem[] }> {
   const url = `https://www.yuque.com/${namespace}/${book}`;
   const response = await fetch(url, {
     headers: {
@@ -185,30 +139,56 @@ async function fetchYuqueBookToc(namespace: string, book: string): Promise<Yuque
   });
 
   if (!response.ok) {
-    throw new Error(`Failed to fetch book: ${response.status}`);
+    throw new Error(`Failed to fetch book page: ${response.status}`);
   }
 
   const html = await response.text();
+  const appData = extractAppData(html);
 
-  // 从 __INITIAL_STATE__ 中提取目录
-  const stateMatch = html.match(/window\.__INITIAL_STATE__\s*=\s*({[\s\S]*?});?\s*<\/script>/);
-  if (stateMatch) {
-    try {
-      const state = JSON.parse(stateMatch[1]);
-      const toc = state?.book?.toc || state?.data?.book?.toc || [];
-      return toc.map((item: any) => ({
-        title: item.title || '',
-        slug: item.slug || item.url || '',
-        url: item.url || item.slug || '',
-        level: item.depth || item.level || 0,
-        type: item.type === 'TITLE' ? 'TITLE' : 'DOC',
-      }));
-    } catch (e) {
-      console.error('Failed to parse initial state:', e);
-    }
+  if (!appData?.book) {
+    throw new Error('Cannot extract book data from page');
   }
 
-  throw new Error('Cannot extract TOC from book page');
+  return {
+    bookId: appData.book.id,
+    toc: appData.book.toc || [],
+  };
+}
+
+// 获取单篇文档内容
+async function fetchYuqueDoc(bookId: number, slug: string, referer: string): Promise<{ title: string; content: string }> {
+  const url = `https://www.yuque.com/api/docs/${slug}?book_id=${bookId}`;
+
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'application/json',
+      'Referer': referer,
+      'x-requested-with': 'XMLHttpRequest',
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch doc: ${response.status}`);
+  }
+
+  const data = await response.json() as any;
+
+  return {
+    title: data.data?.title || slug,
+    content: data.data?.content || data.data?.body || data.data?.body_asl || '',
+  };
+}
+
+// 将语雀 lake 格式转换为 HTML
+function lakeToHtml(lakeContent: string): string {
+  // lake 格式是类似 HTML 的格式，但有一些自定义标签
+  // 移除 lake 的 doctype 和 meta 标签
+  let html = lakeContent
+    .replace(/<!doctype lake>/gi, '')
+    .replace(/<meta[^>]*>/gi, '');
+
+  return html;
 }
 
 async function convertYuqueUrlToMarkdown(
@@ -221,11 +201,12 @@ async function convertYuqueUrlToMarkdown(
   }
 
   const zip = new JSZip();
+  const referer = `https://www.yuque.com/${urlInfo.namespace}/${urlInfo.book}`;
 
   if (urlInfo.isBook) {
     // 整个知识库
-    const toc = await fetchYuqueBookToc(urlInfo.namespace, urlInfo.book);
-    console.log(`Found ${toc.length} items in book`);
+    const { bookId, toc } = await fetchYuqueBookData(urlInfo.namespace, urlInfo.book);
+    console.log(`Found ${toc.length} items in book, bookId: ${bookId}`);
 
     let pathPrefixed: string[] = [];
     let lastLevel = 0;
@@ -241,7 +222,7 @@ async function convertYuqueUrlToMarkdown(
       }
       usedNames.add(sanitizedTitle);
 
-      const currentLevel = item.level;
+      const currentLevel = item.level || 0;
 
       if (currentLevel > lastLevel) {
         pathPrefixed = [...pathPrefixed, lastSanitizedTitle];
@@ -250,10 +231,11 @@ async function convertYuqueUrlToMarkdown(
         pathPrefixed = pathPrefixed.slice(0, -diff);
       }
 
-      if (item.type === 'DOC' && item.slug) {
+      if (item.type === 'DOC' && item.url) {
         try {
-          const doc = await fetchYuqueDoc(urlInfo.namespace, urlInfo.book, item.slug);
-          let html = doc.body_html;
+          console.log(`Fetching doc: ${item.title} (${item.url})`);
+          const doc = await fetchYuqueDoc(bookId, item.url, referer);
+          let html = lakeToHtml(doc.content);
 
           const attachmentsMap = new Map<string, { data: Uint8Array; ext: string }>();
           const outputDirPath = pathPrefixed.join('/');
@@ -275,7 +257,7 @@ async function convertYuqueUrlToMarkdown(
             : `${sanitizedTitle}.md`;
           zip.file(outputPath, markdown);
         } catch (e) {
-          console.error(`Failed to fetch doc ${item.slug}:`, e);
+          console.error(`Failed to fetch doc ${item.url}:`, e);
         }
       }
 
@@ -283,9 +265,11 @@ async function convertYuqueUrlToMarkdown(
       lastLevel = currentLevel;
     }
   } else {
-    // 单篇文档
-    const doc = await fetchYuqueDoc(urlInfo.namespace, urlInfo.book, urlInfo.slug!);
-    let html = doc.body_html;
+    // 单篇文档 - 需要先获取 bookId
+    const { bookId } = await fetchYuqueBookData(urlInfo.namespace, urlInfo.book);
+
+    const doc = await fetchYuqueDoc(bookId, urlInfo.slug!, referer);
+    let html = lakeToHtml(doc.content);
     const sanitizedTitle = sanitizeFileName(doc.title);
 
     const attachmentsMap = new Map<string, { data: Uint8Array; ext: string }>();
@@ -795,7 +779,7 @@ function getUploadHtml(): string {
       <div id="urlTab" class="tab-content active">
         <div class="url-input-area">
           <label for="urlInput">语雀文档 URL</label>
-          <input type="text" id="urlInput" name="yuqueUrl" placeholder="https://www.yuque.com/xxx/yyy/zzz">
+          <input type="text" id="urlInput" name="yuqueUrl" placeholder="https://www.yuque.com/115yun/open">
           <p class="hint">
             支持单篇文档: <code>yuque.com/用户/知识库/文档</code><br>
             支持整个知识库: <code>yuque.com/用户/知识库</code>
