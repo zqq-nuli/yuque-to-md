@@ -1,4 +1,4 @@
-name = "lakebook-worker"
+name = "yuque-to-md"
 main = "src/index.ts"
 compatibility_date = "2024-01-17"
 
