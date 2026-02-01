@@ -134,7 +134,19 @@ async function fetchYuqueBookData(namespace: string, book: string): Promise<{ bo
   const response = await fetch(url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+      'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': '"Windows"',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1',
     },
   });
 
@@ -143,10 +155,14 @@ async function fetchYuqueBookData(namespace: string, book: string): Promise<{ bo
   }
 
   const html = await response.text();
+  console.log('Fetched HTML length:', html.length);
+
   const appData = extractAppData(html);
 
   if (!appData?.book) {
-    throw new Error('Cannot extract book data from page');
+    // 调试信息：打印 HTML 片段以诊断问题
+    console.log('Failed to extract appData. HTML snippet:', html.substring(0, 500));
+    throw new Error('Cannot extract book data from page. The page may require login or is protected.');
   }
 
   return {
@@ -162,13 +178,22 @@ async function fetchYuqueDoc(bookId: number, slug: string, referer: string): Pro
   const response = await fetch(url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'application/json',
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
       'Referer': referer,
       'x-requested-with': 'XMLHttpRequest',
+      'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': '"Windows"',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin',
     },
   });
 
   if (!response.ok) {
+    const text = await response.text();
+    console.log(`Doc fetch failed (${response.status}):`, text.substring(0, 200));
     throw new Error(`Failed to fetch doc: ${response.status}`);
   }
 
@@ -499,6 +524,51 @@ export default {
 
     if (request.method === 'POST') {
       try {
+        const contentType = request.headers.get('Content-Type') || '';
+
+        // 检查是否是 JSON 格式的客户端抓取数据
+        if (contentType.includes('application/json')) {
+          const jsonData = await request.json() as {
+            docs: Array<{ title: string; content: string; path: string }>;
+            downloadImages?: boolean;
+          };
+
+          const zip = new JSZip();
+
+          for (const doc of jsonData.docs) {
+            let html = lakeToHtml(doc.content);
+            const sanitizedTitle = sanitizeFileName(doc.title);
+            const attachmentsMap = new Map<string, { data: Uint8Array; ext: string }>();
+
+            if (jsonData.downloadImages && html) {
+              html = await downloadImageAndPatchHtml(html, sanitizedTitle, attachmentsMap);
+
+              for (const [attachPath, { data }] of attachmentsMap) {
+                const fullPath = doc.path
+                  ? `${doc.path}/${attachPath}`
+                  : attachPath;
+                zip.file(fullPath, data);
+              }
+            }
+
+            const markdown = prettyMd(htmlToMarkdown(html));
+            const outputPath = doc.path
+              ? `${doc.path}/${sanitizedTitle}.md`
+              : `${sanitizedTitle}.md`;
+            zip.file(outputPath, markdown);
+          }
+
+          const zipBlob = await zip.generateAsync({ type: 'arraybuffer' });
+
+          return new Response(zipBlob, {
+            headers: {
+              'Content-Type': 'application/zip',
+              'Content-Disposition': 'attachment; filename="markdown-output.zip"',
+              'Access-Control-Allow-Origin': '*',
+            },
+          });
+        }
+
         const formData = await request.formData();
         const file = formData.get('lakebook') as File | null;
         const yuqueUrl = formData.get('yuqueUrl') as string | null;
@@ -507,7 +577,7 @@ export default {
         let zip: JSZip;
 
         if (yuqueUrl && yuqueUrl.trim()) {
-          // 从语雀 URL 抓取
+          // 从语雀 URL 抓取（服务端模式，可能受反爬虫限制）
           const urlInfo = parseYuqueUrl(yuqueUrl.trim());
           if (!urlInfo) {
             return new Response(JSON.stringify({ error: '无效的语雀 URL，请输入类似 https://www.yuque.com/xxx/yyy 的链接' }), {
@@ -552,8 +622,17 @@ export default {
         });
       } catch (error) {
         console.error('Error processing:', error);
+        const errorMsg = String(error);
+        let userFriendlyError = '处理失败';
+
+        if (errorMsg.includes('Cannot extract book data') || errorMsg.includes('Failed to fetch book page')) {
+          userFriendlyError = '无法抓取语雀页面。这可能是因为：1) 语雀的反爬虫保护阻止了服务端请求；2) 该知识库需要登录才能访问。建议使用 .lakebook 文件方式转换。';
+        } else if (errorMsg.includes('Failed to fetch doc')) {
+          userFriendlyError = '无法获取文档内容。该文档可能需要登录或有访问权限限制。';
+        }
+
         return new Response(
-          JSON.stringify({ error: '处理失败', details: String(error) }),
+          JSON.stringify({ error: userFriendlyError, details: errorMsg }),
           {
             status: 500,
             headers: { 'Content-Type': 'application/json' },
@@ -772,22 +851,23 @@ function getUploadHtml(): string {
 
     <form id="uploadForm" enctype="multipart/form-data">
       <div class="tabs">
-        <button type="button" class="tab active" data-tab="url">输入 URL</button>
-        <button type="button" class="tab" data-tab="file">上传文件</button>
+        <button type="button" class="tab" data-tab="url">输入 URL</button>
+        <button type="button" class="tab active" data-tab="file">上传文件 (推荐)</button>
       </div>
 
-      <div id="urlTab" class="tab-content active">
+      <div id="urlTab" class="tab-content">
         <div class="url-input-area">
           <label for="urlInput">语雀文档 URL</label>
           <input type="text" id="urlInput" name="yuqueUrl" placeholder="https://www.yuque.com/115yun/open">
           <p class="hint">
             支持单篇文档: <code>yuque.com/用户/知识库/文档</code><br>
-            支持整个知识库: <code>yuque.com/用户/知识库</code>
+            支持整个知识库: <code>yuque.com/用户/知识库</code><br>
+            <span style="color: #e67e22;">注意：部分部署环境可能因反爬虫限制无法抓取，建议使用 .lakebook 文件</span>
           </p>
         </div>
       </div>
 
-      <div id="fileTab" class="tab-content">
+      <div id="fileTab" class="tab-content active">
         <div class="upload-area" id="uploadArea">
           <input type="file" name="lakebook" id="fileInput" accept=".lakebook">
           <div class="upload-icon">📄</div>
@@ -827,7 +907,7 @@ function getUploadHtml(): string {
     const tabs = document.querySelectorAll('.tab');
     const tabContents = document.querySelectorAll('.tab-content');
 
-    let currentTab = 'url';
+    let currentTab = 'file';
 
     tabs.forEach(tab => {
       tab.addEventListener('click', () => {
